@@ -26231,7 +26231,7 @@ var proto = Scheduler.prototype;
  * @param {Object} payload
  */
 proto.restoreData = function (ecModel, payload) {
-    // TODO: Only restroe needed series and components, but not all components.
+    // TODO: Only restore needed series and components, but not all components.
     // Currently `restoreData` of all of the series and component will be called.
     // But some independent components like `title`, `legend`, `graphic`, `toolbox`,
     // `tooltip`, `axisPointer`, etc, do not need series refresh when `setOption`,
@@ -43876,8 +43876,31 @@ var clip = {
         return clipped;
     },
 
-    polar: function (coordSysClipArea) {
-        return false;
+    polar: function (coordSysClipArea, layout) {
+        var signR = layout.r0 <= layout.r ? 1 : -1;
+        // Make sure r is larger than r0
+        if (signR < 0) {
+            var r = layout.r;
+            layout.r = layout.r0;
+            layout.r0 = r;
+        }
+
+        var r = mathMin$4(layout.r, coordSysClipArea.r);
+        var r0 = mathMax$4(layout.r0, coordSysClipArea.r0);
+
+        layout.r = r;
+        layout.r0 = r0;
+
+        var clipped = r - r0 < 0;
+
+        // Reverse back
+        if (signR < 0) {
+            var r = layout.r;
+            layout.r = layout.r0;
+            layout.r0 = r;
+        }
+
+        return clipped;
     }
 };
 
@@ -50997,22 +51020,7 @@ TreeNode.prototype = {
         }
         var hostTree = this.hostTree;
         var itemModel = hostTree.data.getItemModel(this.dataIndex);
-        var levelModel = this.getLevelModel();
-
-        // FIXME: refactor levelModel to "beforeLink", and remove levelModel here.
-        if (levelModel) {
-            return itemModel.getModel(path, levelModel.getModel(path));
-        }
-        else {
-            return itemModel.getModel(path);
-        }
-    },
-
-    /**
-     * @return {module:echarts/model/Model}
-     */
-    getLevelModel: function () {
-        return (this.hostTree.levelModels || [])[this.depth];
+        return itemModel.getModel(path);
     },
 
     /**
@@ -51084,9 +51092,8 @@ TreeNode.prototype = {
  * @constructor
  * @alias module:echarts/data/Tree
  * @param {module:echarts/model/Model} hostModel
- * @param {Array.<Object>} levelOptions
  */
-function Tree(hostModel, levelOptions) {
+function Tree(hostModel) {
     /**
      * @type {module:echarts/data/Tree~TreeNode}
      * @readOnly
@@ -51112,15 +51119,6 @@ function Tree(hostModel, levelOptions) {
      * @type {module:echarts/model/Model}
      */
     this.hostModel = hostModel;
-
-    /**
-     * @private
-     * @readOnly
-     * @type {Array.<module:echarts/model/Model}
-     */
-    this.levelModels = map(levelOptions || [], function (levelDefine) {
-        return new Model(levelDefine, hostModel, hostModel.ecModel);
-    });
 
 }
 
@@ -51211,13 +51209,11 @@ Tree.prototype = {
  * @static
  * @param {Object} dataRoot Root node.
  * @param {module:echarts/model/Model} hostModel
- * @param {Object} treeOptions
- * @param {Array.<Object>} treeOptions.levels
  * @return module:echarts/data/Tree
  */
-Tree.createTree = function (dataRoot, hostModel, treeOptions, beforeLink) {
+Tree.createTree = function (dataRoot, hostModel, beforeLink) {
 
-    var tree = new Tree(hostModel, treeOptions && treeOptions.levels);
+    var tree = new Tree(hostModel);
     var listData = [];
     var dimMax = 1;
 
@@ -51325,7 +51321,7 @@ SeriesModel.extend({
         var leaves = option.leaves || {};
         var leavesModel = new Model(leaves, this, this.ecModel);
 
-        var tree = Tree.createTree(root, this, {}, beforeLink);
+        var tree = Tree.createTree(root, this, beforeLink);
 
         function beforeLink(nodeData) {
             nodeData.wrapMethod('getItemModel', function (model, idx) {
@@ -52943,21 +52939,29 @@ SeriesModel.extend({
 
         var levels = option.levels || [];
 
+        // Used in "visual priority" in `treemapVisual.js`.
+        // This way is a little tricky, must satisfy the precondition:
+        //   1. There is no `treeNode.getModel('itemStyle.xxx')` used.
+        //   2. The `Model.prototype.getModel()` will not use any clone-like way.
+        var designatedVisualItemStyle = this.designatedVisualItemStyle = {};
+        var designatedVisualModel = new Model({itemStyle: designatedVisualItemStyle}, this, ecModel);
+
         levels = option.levels = setDefault(levels, ecModel);
         var levelModels = map(levels || [], function (levelDefine) {
-            return new Model(levelDefine, this, ecModel);
+            return new Model(levelDefine, designatedVisualModel, ecModel);
         }, this);
 
         // Make sure always a new tree is created when setOption,
         // in TreemapView, we check whether oldTree === newTree
         // to choose mappings approach among old shapes and new shapes.
-        var tree = Tree.createTree(root, this, null, beforeLink);
+        var tree = Tree.createTree(root, this, beforeLink);
 
         function beforeLink(nodeData) {
             nodeData.wrapMethod('getItemModel', function (model, idx) {
                 var node = tree.getNodeByDataIndex(idx);
                 var levelModel = levelModels[node.depth];
-                levelModel && (model.parentModel = levelModel);
+                // If no levelModel, we also need `designatedVisualModel`.
+                model.parentModel = levelModel || designatedVisualModel;
                 return model;
             });
         }
@@ -55124,21 +55128,14 @@ var treemapVisual = {
     reset: function (seriesModel, ecModel, api, payload) {
         var tree = seriesModel.getData().tree;
         var root = tree.root;
-        var seriesItemStyleModel = seriesModel.getModel(ITEM_STYLE_NORMAL);
 
         if (root.isRemoved()) {
             return;
         }
 
-        var levelItemStyles = map(tree.levelModels, function (levelModel) {
-            return levelModel ? levelModel.get(ITEM_STYLE_NORMAL) : null;
-        });
-
         travelTree(
             root, // Visual should calculate from tree root but not view root.
             {},
-            levelItemStyles,
-            seriesItemStyleModel,
             seriesModel.getViewRoot().getAncestors(),
             seriesModel
         );
@@ -55146,8 +55143,7 @@ var treemapVisual = {
 };
 
 function travelTree(
-    node, designatedVisual, levelItemStyles, seriesItemStyleModel,
-    viewRootAncestors, seriesModel
+    node, designatedVisual, viewRootAncestors, seriesModel
 ) {
     var nodeModel = node.getModel();
     var nodeLayout = node.getLayout();
@@ -55158,10 +55154,7 @@ function travelTree(
     }
 
     var nodeItemStyleModel = node.getModel(ITEM_STYLE_NORMAL);
-    var levelItemStyle = levelItemStyles[node.depth];
-    var visuals = buildVisuals(
-        nodeItemStyleModel, designatedVisual, levelItemStyle, seriesItemStyleModel
-    );
+    var visuals = buildVisuals(nodeItemStyleModel, designatedVisual, seriesModel);
 
     // calculate border color
     var borderColor = nodeItemStyleModel.get('borderColor');
@@ -55194,27 +55187,21 @@ function travelTree(
                 var childVisual = mapVisual$1(
                     nodeModel, visuals, child, index, mapping, seriesModel
                 );
-                travelTree(
-                    child, childVisual, levelItemStyles, seriesItemStyleModel,
-                    viewRootAncestors, seriesModel
-                );
+                travelTree(child, childVisual, viewRootAncestors, seriesModel);
             }
         });
     }
 }
 
-function buildVisuals(
-    nodeItemStyleModel, designatedVisual, levelItemStyle, seriesItemStyleModel
-) {
+function buildVisuals(nodeItemStyleModel, designatedVisual, seriesModel) {
     var visuals = extend({}, designatedVisual);
+    var designatedVisualItemStyle = seriesModel.designatedVisualItemStyle;
 
     each$1(['color', 'colorAlpha', 'colorSaturation'], function (visualName) {
         // Priority: thisNode > thisLevel > parentNodeDesignated > seriesModel
-        var val = nodeItemStyleModel.get(visualName, true); // Ignore parent
-        val == null && levelItemStyle && (val = levelItemStyle[visualName]);
-        val == null && (val = designatedVisual[visualName]);
-        val == null && (val = seriesItemStyleModel.get(visualName));
-
+        designatedVisualItemStyle[visualName] = designatedVisual[visualName];
+        var val = nodeItemStyleModel.get(visualName);
+        designatedVisualItemStyle[visualName] = null;
         val != null && (visuals[visualName] = val);
     });
 
@@ -56952,22 +56939,29 @@ function makeSymbolTypeKey(symbolCategory) {
  * @inner
  */
 function createSymbol$1(name, lineData, idx) {
-    var color = lineData.getItemVisual(idx, 'color');
     var symbolType = lineData.getItemVisual(idx, name);
-    var symbolSize = lineData.getItemVisual(idx, name + 'Size');
 
     if (!symbolType || symbolType === 'none') {
         return;
     }
 
+    var color = lineData.getItemVisual(idx, 'color');
+    var symbolSize = lineData.getItemVisual(idx, name + 'Size');
+    var symbolRotate = lineData.getItemVisual(idx, name + 'Rotate');
+
     if (!isArray(symbolSize)) {
         symbolSize = [symbolSize, symbolSize];
     }
+
     var symbolPath = createSymbol(
         symbolType, -symbolSize[0] / 2, -symbolSize[1] / 2,
         symbolSize[0], symbolSize[1], color
     );
 
+    // rotate by default if symbolRotate is not specified or NaN
+    symbolPath.rotation = symbolRotate == null || isNaN(symbolRotate)
+        ? undefined
+        : +symbolRotate * Math.PI / 180 || 0;
     symbolPath.name = name;
 
     return symbolPath;
@@ -57035,18 +57029,32 @@ function updateSymbolAndLabelBeforeLineUpdate() {
 
     if (symbolFrom) {
         symbolFrom.attr('position', fromPos);
-        var tangent = line.tangentAt(0);
-        symbolFrom.attr('rotation', Math.PI / 2 - Math.atan2(
-            tangent[1], tangent[0]
-        ));
+        // Fix #12388
+        // when symbol is set to be 'arrow' in markLine,
+        // symbolRotate value will be ignored, and compulsively use tangent angle.
+        // rotate by default if symbol rotation is not specified
+        if (symbolFrom.rotation == null
+            || (symbolFrom.shape && symbolFrom.shape.symbolType === 'arrow')) {
+            var tangent = line.tangentAt(0);
+            symbolFrom.attr('rotation', Math.PI / 2 - Math.atan2(
+                tangent[1], tangent[0]
+            ));
+        }
         symbolFrom.attr('scale', [invScale * percent, invScale * percent]);
     }
     if (symbolTo) {
         symbolTo.attr('position', toPos);
-        var tangent = line.tangentAt(1);
-        symbolTo.attr('rotation', -Math.PI / 2 - Math.atan2(
-            tangent[1], tangent[0]
-        ));
+        // Fix #12388
+        // when symbol is set to be 'arrow' in markLine,
+        // symbolRotate value will be ignored, and compulsively use tangent angle.
+        // rotate by default if symbol rotation is not specified
+        if (symbolTo.rotation == null
+            || (symbolTo.shape && symbolTo.shape.symbolType === 'arrow')) {
+            var tangent = line.tangentAt(1);
+            symbolTo.attr('rotation', -Math.PI / 2 - Math.atan2(
+                tangent[1], tangent[0]
+            ));
+        }
         symbolTo.attr('scale', [invScale * percent, invScale * percent]);
     }
 
@@ -59881,6 +59889,7 @@ var FunnelSeries = extendSeriesModel({
         minSize: '0%',
         maxSize: '100%',
         sort: 'descending', // 'ascending', 'descending'
+        orient: 'vertical',
         gap: 0,
         funnelAlign: 'center',
         label: {
@@ -60184,6 +60193,7 @@ function labelLayout$1(data) {
         var itemModel = data.getItemModel(idx);
         var labelModel = itemModel.getModel('label');
         var labelPosition = labelModel.get('position');
+        var orient = itemModel.get('orient');
 
         var labelLineModel = itemModel.getModel('labelLine');
 
@@ -60223,7 +60233,18 @@ function labelLayout$1(data) {
             var x1;
             var y1;
             var x2;
+            var y2;
             var labelLineLen = labelLineModel.get('length');
+            if (__DEV__) {
+                if (orient === 'vertical' && ['top', 'bottom'].indexOf(labelPosition) > -1) {
+                    labelPosition = 'left';
+                    console.warn('Position error: Funnel chart on vertical orient dose not support top and bottom.');
+                }
+                if (orient === 'horizontal' && ['left', 'right'].indexOf(labelPosition) > -1) {
+                    labelPosition = 'top';
+                    console.warn('Position error: Funnel chart on horizontal orient dose not support left and right.');
+                }
+            }
             if (labelPosition === 'left') {
                 // Left side
                 x1 = (points[3][0] + points[0][0]) / 2;
@@ -60240,50 +60261,106 @@ function labelLayout$1(data) {
                 textX = x2 + 5;
                 textAlign = 'left';
             }
+            else if (labelPosition === 'top') {
+                // Top side
+                x1 = (points[3][0] + points[0][0]) / 2;
+                y1 = (points[3][1] + points[0][1]) / 2;
+                y2 = y1 - labelLineLen;
+                textY = y2 - 5;
+                textAlign = 'center';
+            }
+            else if (labelPosition === 'bottom') {
+                // Bottom side
+                x1 = (points[1][0] + points[2][0]) / 2;
+                y1 = (points[1][1] + points[2][1]) / 2;
+                y2 = y1 + labelLineLen;
+                textY = y2 + 5;
+                textAlign = 'center';
+            }
             else if (labelPosition === 'rightTop') {
                 // RightTop side
-                x1 = points[1][0];
-                y1 = points[1][1];
-                x2 = x1 + labelLineLen;
-                textX = x2 + 5;
-                textAlign = 'top';
+                x1 = orient === 'horizontal' ? points[3][0] : points[1][0];
+                y1 = orient === 'horizontal' ? points[3][1] : points[1][1];
+                if (orient === 'horizontal') {
+                    y2 = y1 - labelLineLen;
+                    textY = y2 - 5;
+                    textAlign = 'center';
+                }
+                else {
+                    x2 = x1 + labelLineLen;
+                    textX = x2 + 5;
+                    textAlign = 'top';
+                }
             }
             else if (labelPosition === 'rightBottom') {
                 // RightBottom side
                 x1 = points[2][0];
                 y1 = points[2][1];
-                x2 = x1 + labelLineLen;
-                textX = x2 + 5;
-                textAlign = 'bottom';
+                if (orient === 'horizontal') {
+                    y2 = y1 + labelLineLen;
+                    textY = y2 + 5;
+                    textAlign = 'center';
+                }
+                else {
+                    x2 = x1 + labelLineLen;
+                    textX = x2 + 5;
+                    textAlign = 'bottom';
+                }
             }
             else if (labelPosition === 'leftTop') {
                 // LeftTop side
                 x1 = points[0][0];
-                y1 = points[1][1];
-                x2 = x1 - labelLineLen;
-                textX = x2 - 5;
-                textAlign = 'right';
+                y1 = orient === 'horizontal' ? points[0][1] : points[1][1];
+                if (orient === 'horizontal') {
+                    y2 = y1 - labelLineLen;
+                    textY = y2 - 5;
+                    textAlign = 'center';
+                }
+                else {
+                    x2 = x1 - labelLineLen;
+                    textX = x2 - 5;
+                    textAlign = 'right';
+                }
             }
             else if (labelPosition === 'leftBottom') {
                 // LeftBottom side
-                x1 = points[3][0];
-                y1 = points[2][1];
-                x2 = x1 - labelLineLen;
-                textX = x2 - 5;
-                textAlign = 'right';
+                x1 = orient === 'horizontal' ? points[1][0] : points[3][0];
+                y1 = orient === 'horizontal' ? points[1][1] : points[2][1];
+                if (orient === 'horizontal') {
+                    y2 = y1 + labelLineLen;
+                    textY = y2 + 5;
+                    textAlign = 'center';
+                }
+                else {
+                    x2 = x1 - labelLineLen;
+                    textX = x2 - 5;
+                    textAlign = 'right';
+                }
             }
             else {
-                // Right side
+                // Right side or Bottom side
                 x1 = (points[1][0] + points[2][0]) / 2;
                 y1 = (points[1][1] + points[2][1]) / 2;
-                x2 = x1 + labelLineLen;
-                textX = x2 + 5;
-                textAlign = 'left';
+                if (orient === 'horizontal') {
+                    y2 = y1 + labelLineLen;
+                    textY = y2 + 5;
+                    textAlign = 'center';
+                }
+                else {
+                    x2 = x1 + labelLineLen;
+                    textX = x2 + 5;
+                    textAlign = 'left';
+                }
             }
-            var y2 = y1;
-
+            if (orient === 'horizontal') {
+                x2 = x1;
+                textX = x2;
+            }
+            else {
+                y2 = y1;
+                textY = y2;
+            }
             linePoints = [[x1, y1], [x2, y2]];
-            textY = y2;
         }
 
         layout.label = {
@@ -60304,11 +60381,19 @@ var funnelLayout = function (ecModel, api, payload) {
         var sort = seriesModel.get('sort');
         var viewRect = getViewRect$3(seriesModel, api);
         var indices = getSortedIndices(data, sort);
+        var orient = seriesModel.get('orient');
+        var viewWidth = viewRect.width;
+        var viewHeight = viewRect.height;
+        var x = viewRect.x;
+        var y = viewRect.y;
 
-        var sizeExtent = [
-            parsePercent$1(seriesModel.get('minSize'), viewRect.width),
-            parsePercent$1(seriesModel.get('maxSize'), viewRect.width)
-        ];
+        var sizeExtent = orient === 'horizontal' ? [
+            parsePercent$1(seriesModel.get('minSize'), viewHeight),
+            parsePercent$1(seriesModel.get('maxSize'), viewHeight)
+        ] : [
+                parsePercent$1(seriesModel.get('minSize'), viewWidth),
+                parsePercent$1(seriesModel.get('maxSize'), viewWidth)
+            ];
         var dataExtent = data.getDataExtent(valueDim);
         var min = seriesModel.get('min');
         var max = seriesModel.get('max');
@@ -60321,64 +60406,113 @@ var funnelLayout = function (ecModel, api, payload) {
 
         var funnelAlign = seriesModel.get('funnelAlign');
         var gap = seriesModel.get('gap');
-        var itemHeight = (viewRect.height - gap * (data.count() - 1)) / data.count();
+        var viewSize = orient === 'horizontal' ? viewWidth : viewHeight;
+        var itemSize = (viewSize - gap * (data.count() - 1)) / data.count();
 
-        var y = viewRect.y;
-
-        var getLinePoints = function (idx, offY) {
+        var getLinePoints = function (idx, offset) {
             // End point index is data.count() and we assign it 0
+            if (orient === 'horizontal') {
+                var val = data.get(valueDim, idx) || 0;
+                var itemHeight = linearMap(val, [min, max], sizeExtent, true);
+                var y0;
+                switch (funnelAlign) {
+                    case 'top':
+                        y0 = y;
+                        break;
+                    case 'center':
+                        y0 = y + (viewHeight - itemHeight) / 2;
+                        break;
+                    case 'bottom':
+                        y0 = y + (viewHeight - itemHeight);
+                        break;
+                }
+
+                return [
+                    [offset, y0],
+                    [offset, y0 + itemHeight]
+                ];
+            }
             var val = data.get(valueDim, idx) || 0;
             var itemWidth = linearMap(val, [min, max], sizeExtent, true);
             var x0;
             switch (funnelAlign) {
                 case 'left':
-                    x0 = viewRect.x;
+                    x0 = x;
                     break;
                 case 'center':
-                    x0 = viewRect.x + (viewRect.width - itemWidth) / 2;
+                    x0 = x + (viewWidth - itemWidth) / 2;
                     break;
                 case 'right':
-                    x0 = viewRect.x + viewRect.width - itemWidth;
+                    x0 = x + viewWidth - itemWidth;
                     break;
             }
             return [
-                [x0, offY],
-                [x0 + itemWidth, offY]
+                [x0, offset],
+                [x0 + itemWidth, offset]
             ];
         };
 
         if (sort === 'ascending') {
             // From bottom to top
-            itemHeight = -itemHeight;
+            itemSize = -itemSize;
             gap = -gap;
-            y += viewRect.height;
+            if (orient === 'horizontal') {
+                x += viewWidth;
+            }
+            else {
+                y += viewHeight;
+            }
             indices = indices.reverse();
         }
 
         for (var i = 0; i < indices.length; i++) {
             var idx = indices[i];
             var nextIdx = indices[i + 1];
-
             var itemModel = data.getItemModel(idx);
-            var height = itemModel.get('itemStyle.height');
-            if (height == null) {
-                height = itemHeight;
+
+            if (orient === 'horizontal') {
+                var width = itemModel.get('itemStyle.width');
+                if (width == null) {
+                    width = itemSize;
+                }
+                else {
+                    width = parsePercent$1(width, viewWidth);
+                    if (sort === 'ascending') {
+                        width = -width;
+                    }
+                }
+
+                var start = getLinePoints(idx, x);
+                var end = getLinePoints(nextIdx, x + width);
+
+                x += width + gap;
+
+                data.setItemLayout(idx, {
+                    points: start.concat(end.slice().reverse())
+                });
             }
             else {
-                height = parsePercent$1(height, viewRect.height);
-                if (sort === 'ascending') {
-                    height = -height;
+                var height = itemModel.get('itemStyle.height');
+                if (height == null) {
+                    height = itemSize;
                 }
+                else {
+                    height = parsePercent$1(height, viewHeight);
+                    if (sort === 'ascending') {
+                        height = -height;
+                    }
+                }
+
+                var start = orient === 'horizontal' ? getLinePoints(idx, x) : getLinePoints(idx, y);
+                var end = orient === 'horizontal'
+                    ? getLinePoints(nextIdx, x + width) : getLinePoints(nextIdx, y + height);
+
+                y += height + gap;
+
+                data.setItemLayout(idx, {
+                    points: start.concat(end.slice().reverse())
+                });
             }
-
-            var start = getLinePoints(idx, y);
-            var end = getLinePoints(nextIdx, y + height);
-
-            y += height + gap;
-
-            data.setItemLayout(idx, {
-                points: start.concat(end.slice().reverse())
-            });
         }
 
         labelLayout$1(data);
@@ -72800,18 +72934,25 @@ SeriesModel.extend({
 
         completeTreeValue$1(root);
 
-        var levels = option.levels || [];
-
-        // levels = option.levels = setDefault(levels, ecModel);
-
-        var treeOption = {};
-
-        treeOption.levels = levels;
+        var levelModels = map(option.levels || [], function (levelDefine) {
+            return new Model(levelDefine, this, ecModel);
+        }, this);
 
         // Make sure always a new tree is created when setOption,
         // in TreemapView, we check whether oldTree === newTree
         // to choose mappings approach among old shapes and new shapes.
-        return Tree.createTree(root, this, treeOption).data;
+        var tree = Tree.createTree(root, this, beforeLink);
+
+        function beforeLink(nodeData) {
+            nodeData.wrapMethod('getItemModel', function (model, idx) {
+                var node = tree.getNodeByDataIndex(idx);
+                var levelModel = levelModels[node.depth];
+                levelModel && (model.parentModel = levelModel);
+                return model;
+            });
+        }
+
+        return tree.data;
     },
 
     optionUpdated: function () {
@@ -73181,9 +73322,13 @@ SunburstPieceProto._updateLabel = function (seriesModel, visualColor, state) {
         : itemModel.getModel(state + '.label');
     var labelHoverModel = itemModel.getModel('emphasis.label');
 
+    var labelFormatter = labelModel.get('formatter');
+    // Use normal formatter if no state formatter is defined
+    var labelState = labelFormatter ? state : 'normal';
+
     var text = retrieve(
         seriesModel.getFormattedLabel(
-            this.node.dataIndex, state, null, null, 'label'
+            this.node.dataIndex, labelState, null, null, 'label'
         ),
         this.node.name
     );
@@ -75112,8 +75257,9 @@ function barLayoutPolar(seriesType, ecModel, api) {
         var clampLayout = baseAxis.dim !== 'radius'
             || !seriesModel.get('roundCap', true);
 
-        var valueAxisStart = valueAxis.getExtent()[0];
-
+        var valueAxisStart = valueAxis.dim === 'radius'
+            ? valueAxis.dataToRadius(0)
+            : valueAxis.dataToAngle(0);
         for (var idx = 0, len = data.count(); idx < len; idx++) {
             var value = data.get(valueDim, idx);
             var baseValue = data.get(baseDim, idx);
@@ -75125,6 +75271,7 @@ function barLayoutPolar(seriesType, ecModel, api) {
             // stackResultDimension directly.
             // Only ordinal axis can be stacked.
             if (stacked) {
+
                 if (!lastStackCoords[stackId][baseValue]) {
                     lastStackCoords[stackId][baseValue] = {
                         p: valueAxisStart, // Positive stack
@@ -79426,7 +79573,8 @@ proto$2.onclick = function (ecModel, api) {
         $a.target = '_blank';
         $a.href = url;
         var evt = new MouseEvent('click', {
-            view: window,
+            // some micro front-end framework， window maybe is a Proxy
+            view: document.defaultView,
             bubbles: true,
             cancelable: false
         });
@@ -83347,6 +83495,14 @@ TooltipRichContent.prototype = {
 
     isShow: function () {
         return this._show;
+    },
+
+    dispose: function () {
+        clearTimeout(this._hideTimeout);
+
+        if (this.el) {
+            this._zr.remove(this.el);
+        }
     },
 
     getOuterSize: function () {
@@ -87608,10 +87764,12 @@ MarkerView.extend({
             var itemModel = mpData.getItemModel(idx);
             var symbol = itemModel.getShallow('symbol');
             var symbolSize = itemModel.getShallow('symbolSize');
+            var symbolRotate = itemModel.getShallow('symbolRotate');
             var isFnSymbol = isFunction$1(symbol);
             var isFnSymbolSize = isFunction$1(symbolSize);
+            var isFnSymbolRotate = isFunction$1(symbolRotate);
 
-            if (isFnSymbol || isFnSymbolSize) {
+            if (isFnSymbol || isFnSymbolSize || isFnSymbolRotate) {
                 var rawIdx = mpModel.getRawValue(idx);
                 var dataParams = mpModel.getDataParams(idx);
                 if (isFnSymbol) {
@@ -87621,11 +87779,15 @@ MarkerView.extend({
                     // FIXME 这里不兼容 ECharts 2.x，2.x 貌似参数是整个数据？
                     symbolSize = symbolSize(rawIdx, dataParams);
                 }
+                if (isFnSymbolRotate) {
+                    symbolRotate = symbolRotate(rawIdx, dataParams);
+                }
             }
 
             mpData.setItemVisual(idx, {
                 symbol: symbol,
                 symbolSize: symbolSize,
+                symbolRotate: symbolRotate,
                 color: itemModel.get('itemStyle.color')
                     || seriesData.getVisual('color')
             });
@@ -88061,8 +88223,10 @@ MarkerView.extend({
             ]);
 
             lineData.setItemVisual(idx, {
+                'fromSymbolRotate': fromData.getItemVisual(idx, 'symbolRotate'),
                 'fromSymbolSize': fromData.getItemVisual(idx, 'symbolSize'),
                 'fromSymbol': fromData.getItemVisual(idx, 'symbol'),
+                'toSymbolRotate': toData.getItemVisual(idx, 'symbolRotate'),
                 'toSymbolSize': toData.getItemVisual(idx, 'symbolSize'),
                 'toSymbol': toData.getItemVisual(idx, 'symbol')
             });
@@ -88084,8 +88248,8 @@ MarkerView.extend({
             updateSingleMarkerEndLayout(
                 data, idx, isFrom, seriesModel, api
             );
-
             data.setItemVisual(idx, {
+                symbolRotate: itemModel.get('symbolRotate'),
                 symbolSize: itemModel.get('symbolSize') || symbolSize[isFrom ? 0 : 1],
                 symbol: itemModel.get('symbol', true) || symbolType[isFrom ? 0 : 1],
                 color: itemModel.get('itemStyle.color') || seriesData.getVisual('color')
